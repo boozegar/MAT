@@ -154,3 +154,165 @@ class ReferenceStyleInjection(nn.Module):
         combined_style = torch.cat([original_style, ref_style], dim=1)
         final_style = self.fusion_layer(combined_style)
         return final_style
+
+
+# 4090优化版本 - 轻量级模块
+@persistence.persistent_class
+class LightweightReferenceEncoder(nn.Module):
+    """
+    轻量级参考图编码器，专为4090单卡设计
+    参数量控制在5M以下
+    """
+    def __init__(self, 
+                 in_channels=3,
+                 feature_dim=256,  # 减小特征维度
+                 num_layers=3):    # 减少层数
+        super().__init__()
+        self.feature_dim = feature_dim
+        
+        # 轻量级卷积编码器
+        channels = [in_channels, 32, 64, feature_dim]
+        self.conv_layers = nn.ModuleList()
+        
+        for i in range(num_layers):
+            self.conv_layers.append(
+                nn.Sequential(
+                    nn.Conv2d(channels[i], channels[i+1], 4, 2, 1),
+                    nn.BatchNorm2d(channels[i+1]),
+                    nn.LeakyReLU(0.2, inplace=True)
+                )
+            )
+        
+        # 自适应池化 + 全连接
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(4)  # 输出4x4特征图
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # 轻量级特征映射
+        self.global_mapper = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(feature_dim // 2, feature_dim)
+        )
+        
+        # 局部特征处理
+        self.local_conv = nn.Conv2d(feature_dim, feature_dim // 2, 1)
+        
+    def forward(self, reference_img):
+        """
+        Args:
+            reference_img: (B, C, H, W) 参考图像，任意尺寸
+        Returns:
+            dict: 包含全局和局部特征
+        """
+        B = reference_img.shape[0]
+        
+        # 如果输入尺寸过大，先resize到合理大小
+        if reference_img.shape[-1] > 256:
+            reference_img = F.interpolate(reference_img, size=256, mode='bilinear', align_corners=False)
+        
+        x = reference_img
+        
+        # 卷积特征提取
+        for conv in self.conv_layers:
+            x = conv(x)
+        
+        # 全局特征
+        global_feat = self.global_pool(x).view(B, -1)
+        global_feat = self.global_mapper(global_feat)
+        
+        # 局部特征 (4x4)
+        local_feat = self.adaptive_pool(x)
+        local_feat = self.local_conv(local_feat)  # 降维减少计算
+        
+        return {
+            'global': global_feat,        # (B, feature_dim)
+            'local': local_feat,          # (B, feature_dim//2, 4, 4)
+            'raw': x                      # 原始特征图
+        }
+
+
+@persistence.persistent_class 
+class ReferenceAdapter(nn.Module):
+    """
+    参考图适配器，将参考图特征适配到MAT的特征空间
+    这是唯一需要训练的模块，参数量极小
+    """
+    def __init__(self, mat_feature_dim, ref_feature_dim=256):
+        super().__init__()
+        
+        # 特征维度适配
+        self.feature_adapter = nn.Sequential(
+            nn.Linear(ref_feature_dim, mat_feature_dim),
+            nn.LayerNorm(mat_feature_dim),
+            nn.GELU()
+        )
+        
+        # 轻量级注意力机制
+        self.attention = nn.MultiheadAttention(
+            embed_dim=mat_feature_dim,
+            num_heads=4,  # 减少注意力头数
+            batch_first=True,
+            dropout=0.1
+        )
+        
+        # 门控融合
+        self.gate = nn.Sequential(
+            nn.Linear(mat_feature_dim * 2, mat_feature_dim),
+            nn.Sigmoid()
+        )
+        
+        # 可学习的融合权重
+        self.alpha = nn.Parameter(torch.tensor(0.1))  # 初始化为小值，避免破坏预训练特征
+        
+    def forward(self, mat_features, ref_features):
+        """
+        Args:
+            mat_features: (B, N, D) MAT的特征
+            ref_features: (B, ref_dim) 参考图全局特征
+        Returns:
+            fused_features: (B, N, D) 融合后的特征
+        """
+        B, N, D = mat_features.shape
+        
+        # 适配参考图特征维度
+        ref_adapted = self.feature_adapter(ref_features)  # (B, D)
+        ref_adapted = ref_adapted.unsqueeze(1).expand(B, N, D)  # (B, N, D)
+        
+        # 自注意力融合（轻量级）
+        attended_feat, _ = self.attention(mat_features, ref_adapted, ref_adapted)
+        
+        # 门控融合
+        concat_feat = torch.cat([mat_features, attended_feat], dim=-1)
+        gate_weight = self.gate(concat_feat)  # (B, N, D)
+        
+        # 加权融合
+        fused = mat_features + self.alpha * gate_weight * attended_feat
+        
+        return fused
+
+
+@persistence.persistent_class
+class LightweightStyleInjector(nn.Module):
+    """
+    轻量级样式注入器，4090优化版本
+    """
+    def __init__(self, style_dim, ref_dim=256):
+        super().__init__()
+        
+        self.style_adapter = nn.Sequential(
+            nn.Linear(ref_dim, style_dim // 2),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(style_dim // 2, style_dim)
+        )
+        
+        # 自适应权重
+        self.weight = nn.Parameter(torch.tensor(0.2))
+        
+    def forward(self, original_style, ref_global_feat):
+        """
+        Args:
+            original_style: (B, style_dim) 原始style
+            ref_global_feat: (B, ref_dim) 参考图全局特征
+        """
+        ref_style = self.style_adapter(ref_global_feat)
+        return original_style + self.weight * ref_style
